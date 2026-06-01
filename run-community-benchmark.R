@@ -279,6 +279,60 @@ bench_python <- function(system, backend, version, threads_label, threads_k) {
   }
 }
 
+# --- Machine-load sampler (issue #2) ----------------------------------------
+# Record CPU/memory/thermal state while the grid runs, so a run taken under
+# background load can be detected after the fact (replication cancels random
+# noise, not systematic contamination). Background shell process — R has no
+# native threads; sampler.sh is decoupled and killed by PID. Record-only.
+
+sampler_script <- "sampler.sh"
+load_tmp <- tempfile(fileext = ".jsonl")
+sampler_pid <- NA_integer_
+if (file.exists(sampler_script)) {
+  sampler_pid <- tryCatch(
+    as.integer(system2("bash", c(sampler_script, shQuote(load_tmp), "2"),
+                       stdout = FALSE, stderr = FALSE, wait = FALSE)),
+    error = function(e) NA_integer_)
+  # Kill the sampler + clean the tmpfile even if the grid errors out.
+  on.exit({
+    if (!is.na(sampler_pid)) tryCatch(tools::pskill(sampler_pid), error = function(e) NULL)
+    unlink(load_tmp)
+  }, add = TRUE)
+}
+
+## Parse the sampler JSONL into meta$load (samples + summary). Returns NULL when
+## no sampler ran or it produced nothing (graceful — load is optional provenance).
+collect_load <- function(path, cadence_s = 2L) {
+  if (!file.exists(path)) return(NULL)
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character())
+  lines <- lines[nzchar(lines)]
+  if (!length(lines)) return(NULL)
+  if (!requireNamespace("jsonlite", quietly = TRUE)) return(NULL)
+  samples <- lapply(lines, function(ln) tryCatch(jsonlite::fromJSON(ln, simplifyVector = TRUE),
+                                                 error = function(e) NULL))
+  samples <- Filter(Negate(is.null), samples)
+  if (!length(samples)) return(NULL)
+  # JSON null → R NULL, which write_json re-serializes as {} (empty object).
+  # Normalize the optional cpu_speed_limit field to NA so it round-trips as null.
+  samples <- lapply(samples, function(s) {
+    if (is.null(s$cpu_speed_limit)) s$cpu_speed_limit <- NA_real_
+    s
+  })
+  l1   <- vapply(samples, function(s) as.numeric(.or(s$loadavg_1m, NA_real_)), numeric(1))
+  free <- vapply(samples, function(s) as.numeric(.or(s$free_mb,   NA_real_)), numeric(1))
+  spd  <- vapply(samples, function(s) if (is.null(s$cpu_speed_limit)) NA_real_ else as.numeric(s$cpu_speed_limit), numeric(1))
+  list(
+    samples = samples,
+    summary = list(
+      loadavg_1m_median = stats::median(l1, na.rm = TRUE),
+      free_mb_min       = suppressWarnings(min(free, na.rm = TRUE)),
+      throttled_ever    = any(!is.na(spd) & spd < 100),
+      n_samples         = length(samples),
+      cadence_s         = cadence_s
+    )
+  )
+}
+
 # --- Run the grid -----------------------------------------------------------
 
 # Generate the run id BEFORE the seeded timing loops below: the loops call
@@ -297,9 +351,18 @@ for (tl in names(thread_levels)) {
   if (have_jax)   bench_python("JAX", "jax", jax_ver, tl, k)
 }
 
+# --- Stop the load sampler + collect ----------------------------------------
+
+if (!is.na(sampler_pid)) {
+  tryCatch(tools::pskill(sampler_pid), error = function(e) NULL)
+  Sys.sleep(0.2)  # let the final buffered line flush
+}
+load_info <- collect_load(load_tmp, cadence_s = 2L)
+
 # --- Build and write the run-log --------------------------------------------
 
-meta   <- capture_prov(contributor = opt_contrib, systems = systems_map)
+meta <- capture_prov(contributor = opt_contrib, systems = systems_map)
+if (!is.null(load_info)) meta$load <- load_info
 log <- list(schema_version = SCHEMA_VERSION, run_id = run_id,
             harness_version = HARNESS_VERSION, meta = meta,
             measurements = measurements)

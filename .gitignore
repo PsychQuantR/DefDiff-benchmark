@@ -1,0 +1,3 @@
+
+# stray root-level run-logs from non --append runs (real logs live in community-logs/)
+/2*.json
